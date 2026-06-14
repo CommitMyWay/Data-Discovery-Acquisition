@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 sources/__init__.py — Source crawler implementations for all 6 platforms.
 Each class inherits from BaseCrawler and implements crawl() → list[dict].
@@ -19,12 +21,6 @@ import re
 import time
 from datetime import datetime, timezone
 from urllib.parse import quote
-
-import requests
-from bs4 import BeautifulSoup
-
-from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, CacheMode
-from crawl4ai.extraction_strategy import JsonCssExtractionStrategy
 
 from scripts.crawl import BaseCrawler, CrawlError
 
@@ -150,6 +146,8 @@ class AppStoreCrawler(BaseCrawler):
         self.app_id = app_id
 
     def _fetch_page(self, page: int):
+        import requests
+
         url = (
             f"https://itunes.apple.com/rss/customerreviews/id={self.app_id}"
             f"/sortBy=mostRecent/json?country=vn&limit=50&page={page}"
@@ -395,6 +393,9 @@ class RedditCrawler(BaseCrawler):
         self.max_concurrent = max_concurrent
 
     async def _async_crawl(self) -> list:
+        from crawl4ai import AsyncWebCrawler
+        from crawl4ai.extraction_strategy import JsonCssExtractionStrategy
+
         browser_cfg = _make_browser_config()
         results = []
         post_meta: dict[str, dict] = {}  # url → {title, subreddit, date, score}
@@ -552,7 +553,9 @@ class RedditCrawler(BaseCrawler):
 # Shared crawl4ai config (used by both Tinhte and Voz)
 # ---------------------------------------------------------------------------
 
-def _make_browser_config() -> BrowserConfig:
+def _make_browser_config():
+    from crawl4ai import BrowserConfig
+
     return BrowserConfig(
         headless=True,
         browser_type="chromium",
@@ -565,7 +568,9 @@ def _make_run_config(
     css_selector: str = None,
     page_timeout: int = 30_000,
     mean_delay: float = 1.5,
-) -> CrawlerRunConfig:
+):
+    from crawl4ai import CacheMode, CrawlerRunConfig
+
     return CrawlerRunConfig(
         cache_mode=CacheMode.BYPASS,          # Always fetch fresh
         magic=True,                            # Auto anti-bot: hides automation signals
@@ -644,6 +649,9 @@ class TinhteCrawler(BaseCrawler):
         self.max_concurrent = max_concurrent  # Concurrent post page fetches
 
     async def _async_crawl(self) -> list:
+        from crawl4ai import AsyncWebCrawler
+        from crawl4ai.extraction_strategy import JsonCssExtractionStrategy
+
         browser_cfg = _make_browser_config()
         results = []
         seen_urls = set()
@@ -810,6 +818,9 @@ class VozCrawler(BaseCrawler):
         return url
 
     async def _async_crawl(self) -> list:
+        from crawl4ai import AsyncWebCrawler
+        from crawl4ai.extraction_strategy import JsonCssExtractionStrategy
+
         browser_cfg = _make_browser_config()
         results = []
         seen_threads = set()

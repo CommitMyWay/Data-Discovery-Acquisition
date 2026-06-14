@@ -146,6 +146,7 @@ data = await run_research(apps=["MoMo"], goal="product", focus_area="Login")
 
 # data["reviews"]        → list of qualified review dicts
 # data["reviews_by_app"] → reviews split by app name
+# data["references"]     → compact source links for citations
 # data["stats"]          → per-app counts by source
 # data["focus_area"]     → topic to deep-dive (if any)
 # data["goal"]           → "product" | "marketing" | "qa"
@@ -161,6 +162,7 @@ With `data` in context, the agent should produce:
    - **PO**: backlog priorities with P0/P1/P2 labels
    - **QA**: specific test scenarios targeting reported failures
    - **Marketing**: messaging angles, sentiment risks to address
+6. **References** — include source links from `data["references"]` whenever crawling returns live or fallback records with URLs
 
 Goal guides the depth of each section:
 - `product` → emphasise bugs, performance, UX friction

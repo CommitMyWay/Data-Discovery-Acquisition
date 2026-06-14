@@ -154,6 +154,42 @@ async def _crawl_app(app_cfg: dict, sources: list, common_kwargs: dict) -> list:
     return all_reviews
 
 
+def _review_title(review: dict) -> str | None:
+    metadata = review.get("metadata") or {}
+    return (
+        metadata.get("video_title")
+        or metadata.get("thread_title")
+        or metadata.get("review_title")
+    )
+
+
+def _build_references(reviews: list[dict]) -> list[dict]:
+    """Build compact source references the agent can cite in its final answer."""
+    references = []
+    seen = set()
+
+    for review in reviews:
+        url = review.get("url") or (review.get("metadata") or {}).get("video_url")
+        if not url:
+            continue
+
+        key = (review.get("source"), url, review.get("id"))
+        if key in seen:
+            continue
+        seen.add(key)
+
+        references.append({
+            "source": review.get("source"),
+            "app": review.get("app"),
+            "title": _review_title(review),
+            "url": url,
+            "date": review.get("date"),
+            "review_id": review.get("id"),
+        })
+
+    return references
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -194,6 +230,9 @@ async def run_research(
             "MoMo":    [...],
             "ZaloPay": [...],
         },
+        "references": [            # compact source links for citations
+            {"source": "youtube", "title": "...", "url": "...", ...},
+        ],
         "stats": {
             "MoMo":    {"total": 300, "qualified": 210, "by_source": {...}},
             "ZaloPay": {"total": 280, "qualified": 195, "by_source": {...}},
@@ -268,6 +307,7 @@ async def run_research(
         "focus_area":     focus_area,
         "reviews":        all_reviews,
         "reviews_by_app": reviews_by_app,
+        "references":     _build_references(all_reviews),
         "stats":          stats,
         "params": {
             "days_back":     days_back,
