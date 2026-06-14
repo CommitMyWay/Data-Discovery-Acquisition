@@ -20,6 +20,7 @@ def to_iso(dt):
     if dt is None:
         return None
     if isinstance(dt, datetime):
+        # Label as UTC (assume input is already UTC / source-local); not a conversion.
         return dt.replace(tzinfo=timezone.utc).isoformat()
     if isinstance(dt, (int, float)):
         return datetime.utcfromtimestamp(dt).replace(tzinfo=timezone.utc).isoformat()
