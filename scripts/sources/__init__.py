@@ -4,22 +4,29 @@ from __future__ import annotations
 sources/__init__.py — Source crawler implementations for all 6 platforms.
 Each class inherits from BaseCrawler and implements crawl() → list[dict].
 
-Source strategy:
-  Google Play  → google-play-scraper  (internal Play API, no scraping needed)
-  App Store    → iTunes RSS API       (clean JSON, no scraping needed)
-  YouTube      → yt-dlp               (gold standard, handles auth + subtitles)
-  Reddit       → public .json API     (read-only, no auth needed)
-  Tinhte       → crawl4ai             (JS rendering + anti-bot for XenForo)
-  Voz          → crawl4ai             (JS rendering + anti-bot for XenForo)
+Source strategy (no browser engine required — see references/sources.md):
+  Google Play  → google-play-scraper  (internal Play API, pure-Python, no browser)
+  App Store    → iTunes RSS API       (stdlib urllib, clean JSON)
+  YouTube      → yt-dlp               (pure-Python, handles auth + subtitles)
+  Reddit       → public .json API     (stdlib urllib, read-only, no auth, no browser)
+  Tinhte       → static HTML          (stdlib urllib + html.parser; best-effort → fallback)
+  Voz          → static HTML          (stdlib urllib + html.parser; best-effort → fallback)
+
+Only google-play-scraper and yt-dlp are third-party, and both are pure-Python
+wheels (no Playwright/Chromium). The other four sources use the standard library
+only, so this module imports cleanly even when nothing is pip-installed — the two
+third-party libs are imported lazily inside their crawlers.
 """
 
-import asyncio
 import hashlib
 import json
 import logging
 import re
 import time
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
+from html.parser import HTMLParser
 from urllib.parse import quote
 
 from scripts.crawl import BaseCrawler, CrawlError
@@ -27,12 +34,43 @@ from scripts.crawl import BaseCrawler, CrawlError
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# Stdlib HTTP helpers (replace `requests` + crawl4ai/Playwright)
+# ---------------------------------------------------------------------------
+
+# A realistic browser UA — XenForo forums (Tinhte/Voz) and Reddit serve clean
+# HTML/JSON to this without a headless browser. urlopen raises HTTPError/URLError
+# on any failure, which propagates through BaseCrawler.fetch_with_retry → retry →
+# CrawlError → load_fallback(). That preserves the skill's retry/fallback contract.
+_DEFAULT_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "vi,en-US;q=0.9,en;q=0.8",
+}
+
+
+def _http_get_text(url: str, headers: dict = None, timeout: int = 20) -> str:
+    """GET a URL and return decoded text. Raises on HTTP/network error."""
+    req = urllib.request.Request(url, headers={**_DEFAULT_HEADERS, **(headers or {})})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        charset = resp.headers.get_content_charset() or "utf-8"
+        return resp.read().decode(charset, errors="replace")
+
+
+def _http_get_json(url: str, headers: dict = None, timeout: int = 20):
+    """GET a URL and parse the body as JSON. Raises on HTTP/network/parse error."""
+    return json.loads(_http_get_text(url, headers=headers, timeout=timeout))
+
+
+# ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
 
 def _make_id(source: str, author: str, content: str) -> str:
     normalized = re.sub(r'\s+', ' ', content.lower()).strip()
-    normalized = re.sub(r'[^\w\s\u00c0-\u024f\u1e00-\u1eff]', '', normalized)
+    normalized = re.sub(r'[^\w\sÀ-ɏḀ-ỿ]', '', normalized)
     key = f"{source}::{author}::{normalized[:200]}"
     return "sha256:" + hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
 
@@ -146,15 +184,11 @@ class AppStoreCrawler(BaseCrawler):
         self.app_id = app_id
 
     def _fetch_page(self, page: int):
-        import requests
-
         url = (
             f"https://itunes.apple.com/rss/customerreviews/id={self.app_id}"
             f"/sortBy=mostRecent/json?country=vn&limit=50&page={page}"
         )
-        resp = requests.get(url, timeout=20)
-        resp.raise_for_status()
-        data = resp.json()
+        data = _http_get_json(url)
         return data.get("feed", {}).get("entry", [])
 
     def crawl(self) -> list:
@@ -324,602 +358,426 @@ class YouTubeCrawler(BaseCrawler):
 
 
 # ---------------------------------------------------------------------------
-# 4. Reddit
+# 4. Reddit  —  public JSON API (no auth, no browser)
 # ---------------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# 4. Reddit  —  crawl4ai (old.reddit.com, no credentials needed)
-# ---------------------------------------------------------------------------
-
-# old.reddit.com has stable, static HTML — far easier to parse than new Reddit's
-# React SPA. magic=True handles the occasional Cloudflare check.
-
-_REDDIT_SEARCH_SCHEMA = {
-    "name": "RedditSearchResults",
-    "baseSelector": "div.thing.link",
-    "fields": [
-        {"name": "title",     "selector": "a.title",               "type": "text"},
-        {"name": "href",      "selector": "a.title",               "type": "attribute", "attribute": "href"},
-        {"name": "date",      "selector": "time.live-timestamp",   "type": "attribute", "attribute": "datetime"},
-        {"name": "score",     "selector": "span.score.unvoted",    "type": "text"},
-        {"name": "subreddit", "selector": "a.subreddit",           "type": "text"},
-    ],
-}
-
-_REDDIT_POST_SCHEMA = {
-    "name": "RedditPostContent",
-    "baseSelector": "div.thing.link",
-    "fields": [
-        {"name": "selftext", "selector": "div.usertext-body div.md", "type": "text"},
-        {"name": "title",    "selector": "a.title",                  "type": "text"},
-        {"name": "author",   "selector": "a.author",                 "type": "text"},
-        {"name": "date",     "selector": "time.live-timestamp",      "type": "attribute", "attribute": "datetime"},
-        {"name": "score",    "selector": "span.score.unvoted",       "type": "text"},
-    ],
-}
-
-_REDDIT_COMMENTS_SCHEMA = {
-    "name": "RedditComments",
-    "baseSelector": "div.comment",
-    "fields": [
-        {"name": "author",  "selector": "a.author",               "type": "text"},
-        {"name": "content", "selector": "div.usertext-body",      "type": "text"},
-        {"name": "date",    "selector": "time.live-timestamp",    "type": "attribute", "attribute": "datetime"},
-        {"name": "score",   "selector": "span.score",             "type": "text"},
-    ],
-}
-
+# reddit.com exposes a read-only JSON view of every listing by appending `.json`.
+# No OAuth, no credentials, no headless browser — just HTTP + a descriptive UA.
+# Rate limit is ~60 req/min unauthenticated; we sleep between requests to stay under.
 
 class RedditCrawler(BaseCrawler):
     """
-    Reddit crawler using crawl4ai against old.reddit.com.
-
-    No credentials required — old.reddit.com serves static HTML that
-    crawl4ai's Playwright browser renders cleanly. The magic=True flag
-    handles Cloudflare checks that occasionally appear.
+    Reddit crawler using the public `.json` endpoints via stdlib urllib.
 
     Strategy:
-      Phase A — Search old.reddit.com, collect post URLs
-      Phase B — Fetch each post page concurrently via arun_many()
-                Extract: post selftext + all comments
+      Phase A — GET /search.json (paginated via `after`), collect post listings
+      Phase B — for the top posts, GET {permalink}.json → post selftext + comments
+                (comments are walked recursively through the `replies` tree)
     """
-    BASE_URL = "https://old.reddit.com"
+    BASE_URL = "https://www.reddit.com"
 
     def __init__(self, search_query: str, max_search_pages: int = 3,
-                 max_concurrent: int = 4, **kwargs):
+                 max_posts: int = 25, **kwargs):
         super().__init__(source_name="reddit", **kwargs)
         self.search_query = search_query
         self.max_search_pages = max_search_pages
-        self.max_concurrent = max_concurrent
+        self.max_posts = max_posts  # how many posts to fetch comment threads for
 
-    async def _async_crawl(self) -> list:
-        from crawl4ai import AsyncWebCrawler
-        from crawl4ai.extraction_strategy import JsonCssExtractionStrategy
+    def _search(self) -> list:
+        """Return raw post `child` dicts from paginated search.json."""
+        children = []
+        after = None
+        for page in range(self.max_search_pages):
+            url = (
+                f"{self.BASE_URL}/search.json"
+                f"?q={quote(self.search_query)}&sort=new&t=year&limit=100&type=link"
+            )
+            if after:
+                url += f"&after={after}"
+            data = self.fetch_with_retry(_http_get_json, url)
+            batch = (data.get("data") or {}).get("children") or []
+            if not batch:
+                break
+            children.extend(batch)
+            after = (data.get("data") or {}).get("after")
+            if not after:
+                break
+            time.sleep(1)
+        return children
 
-        browser_cfg = _make_browser_config()
+    def _fetch_thread(self, permalink: str):
+        url = f"{self.BASE_URL}{permalink}.json?limit=200&depth=4"
+        return self.fetch_with_retry(_http_get_json, url)
+
+    def _walk_comments(self, children: list, out: list, meta: dict, depth: int = 1):
+        """Recursively flatten the Reddit comment `replies` tree into reviews."""
+        for child in children:
+            if child.get("kind") != "t1":
+                continue
+            cd = child.get("data") or {}
+            body = (cd.get("body") or "").strip()
+            if body and body not in ("[deleted]", "[removed]"):
+                out.append(_make_review(
+                    source="reddit", app=self.app_name,
+                    author=(cd.get("author") or "anonymous"),
+                    rating=None,
+                    content=body,
+                    date=_to_iso(cd.get("created_utc")),
+                    url=self.BASE_URL + meta["permalink"],
+                    metadata={
+                        "subreddit": meta.get("subreddit"),
+                        "post_score": cd.get("score"),
+                        "comment_depth": depth,
+                        "thread_title": meta.get("title", ""),
+                    },
+                ))
+            replies = cd.get("replies")
+            if isinstance(replies, dict):
+                self._walk_comments(
+                    (replies.get("data") or {}).get("children") or [],
+                    out, meta, depth + 1,
+                )
+
+    def crawl(self) -> list:
         results = []
-        post_meta: dict[str, dict] = {}  # url → {title, subreddit, date, score}
+        posts = self._search()
+        logger.info("[reddit] Discovered %d posts", len(posts))
 
-        async with AsyncWebCrawler(config=browser_cfg) as crawler:
+        for child in posts[:self.max_posts]:
+            d = child.get("data") or {}
+            permalink = d.get("permalink")
+            if not permalink:
+                continue
 
-            # ── Phase A: Collect post URLs from search ───────────────────────
-            search_cfg = _make_run_config(
-                wait_for="css:div.thing.link",
-                extraction_strategy=JsonCssExtractionStrategy(_REDDIT_SEARCH_SCHEMA),
-                mean_delay=1.5,
-            )
+            title = (d.get("title") or "").strip()
+            selftext = (d.get("selftext") or "").strip()
+            content = f"{title}. {selftext}".strip() if selftext else title
+            meta = {
+                "permalink": permalink,
+                "subreddit": d.get("subreddit"),
+                "title": title,
+            }
 
-            next_url = (
-                f"{self.BASE_URL}/search"
-                f"?q={quote(self.search_query)}&sort=new&t=year&type=link"
-            )
+            # Post itself
+            if content:
+                results.append(_make_review(
+                    source="reddit", app=self.app_name,
+                    author=(d.get("author") or "anonymous"),
+                    rating=None,
+                    content=content,
+                    date=_to_iso(d.get("created_utc")),
+                    url=self.BASE_URL + permalink,
+                    metadata={
+                        "subreddit": d.get("subreddit"),
+                        "post_score": d.get("score"),
+                        "comment_depth": 0,
+                        "thread_title": title,
+                    },
+                ))
 
-            for page in range(self.max_search_pages):
-                if not next_url:
-                    break
-
-                result = await crawler.arun(url=next_url, config=search_cfg)
-
-                if not result.success:
-                    logger.warning("[reddit] Search page %d failed: %s", page + 1, result.error_message)
-                    break
-
-                try:
-                    rows = json.loads(result.extracted_content or "[]")
-                except (json.JSONDecodeError, TypeError):
-                    rows = []
-
-                if not rows:
-                    break
-
-                for row in rows:
-                    href = row.get("href", "")
-                    if not href or href in post_meta:
-                        continue
-                    # Ensure we use old.reddit.com for post pages too
-                    post_url = re.sub(r'https?://(www\.)?reddit\.com', self.BASE_URL, href)
-                    if not post_url.startswith("http"):
-                        post_url = self.BASE_URL + post_url
-                    post_meta[post_url] = {
-                        "title":     row.get("title", "").strip(),
-                        "subreddit": row.get("subreddit", ""),
-                        "date":      row.get("date"),
-                        "score":     row.get("score", "0"),
-                    }
-
-                # Find next-page link from rendered HTML
-                from bs4 import BeautifulSoup
-                soup = BeautifulSoup(result.html or "", "lxml")
-                next_el = soup.select_one("span.next-button a")
-                next_url = next_el["href"] if next_el else None
-
-            logger.info("[reddit] Discovered %d posts", len(post_meta))
-
-            # ── Phase B: Fetch post content + comments concurrently ──────────
-            # Fetch post page with both schemas — run two passes per URL
-            # (post body and comments use different baseSelectors)
-            post_cfg = _make_run_config(
-                wait_for="css:div.thing.link",
-                extraction_strategy=JsonCssExtractionStrategy(_REDDIT_POST_SCHEMA),
-                mean_delay=1.5,
-            )
-            comment_cfg = _make_run_config(
-                wait_for="css:div.comment",
-                extraction_strategy=JsonCssExtractionStrategy(_REDDIT_COMMENTS_SCHEMA),
-                mean_delay=1.5,
-            )
-
-            post_urls = list(post_meta.keys())
-
-            # Fetch post body
-            post_responses = await crawler.arun_many(urls=post_urls, config=post_cfg)
-            for resp in post_responses:
-                meta = post_meta.get(resp.url, {})
-                if not resp.success:
-                    logger.debug("[reddit] Post fetch failed %s: %s", resp.url, resp.error_message)
-                    continue
-                try:
-                    posts = json.loads(resp.extracted_content or "[]")
-                except (json.JSONDecodeError, TypeError):
-                    posts = []
-
-                for p in posts:
-                    selftext = (p.get("selftext") or "").strip()
-                    title = (p.get("title") or meta.get("title", "")).strip()
-                    content = f"{title}. {selftext}".strip() if selftext else title
-                    if not content:
-                        continue
-                    try:
-                        score = int(re.sub(r'[^\d]', '', p.get("score") or "0") or "0")
-                    except ValueError:
-                        score = 0
-                    results.append(_make_review(
-                        source="reddit", app=self.app_name,
-                        author=(p.get("author") or "anonymous").strip(),
-                        rating=None,
-                        content=content,
-                        date=p.get("date") or meta.get("date"),
-                        url=resp.url,
-                        metadata={
-                            "subreddit": meta.get("subreddit"),
-                            "post_score": score,
-                            "comment_depth": 0,
-                            "thread_title": title,
-                        },
-                    ))
-
-            # Fetch comments
-            comment_responses = await crawler.arun_many(urls=post_urls, config=comment_cfg)
-            for resp in comment_responses:
-                meta = post_meta.get(resp.url, {})
-                if not resp.success:
-                    continue
-                try:
-                    comments = json.loads(resp.extracted_content or "[]")
-                except (json.JSONDecodeError, TypeError):
-                    comments = []
-
-                for c in comments:
-                    content = (c.get("content") or "").strip()
-                    if not content:
-                        continue
-                    try:
-                        score = int(re.sub(r'[^\d]', '', c.get("score") or "0") or "0")
-                    except ValueError:
-                        score = 0
-                    results.append(_make_review(
-                        source="reddit", app=self.app_name,
-                        author=(c.get("author") or "anonymous").strip(),
-                        rating=None,
-                        content=content,
-                        date=c.get("date"),
-                        url=resp.url,
-                        metadata={
-                            "subreddit": meta.get("subreddit"),
-                            "post_score": score,
-                            "comment_depth": 1,
-                            "thread_title": meta.get("title", ""),
-                        },
-                    ))
+            # Comments
+            try:
+                listing = self._fetch_thread(permalink)
+                if isinstance(listing, list) and len(listing) > 1:
+                    comment_children = (
+                        (listing[1].get("data") or {}).get("children") or []
+                    )
+                    self._walk_comments(comment_children, results, meta, depth=1)
+            except CrawlError as e:
+                logger.warning("[reddit] Comments failed for %s: %s", permalink, e)
+            time.sleep(1)
 
         logger.info("[reddit] Fetched %d items for query: %s", len(results), self.search_query)
         return results
 
-    def crawl(self) -> list:
-        return _run_async(self._async_crawl())
+
+# ---------------------------------------------------------------------------
+# XenForo HTML parsing (shared by Tinhte and Voz — both run XenForo)
+# ---------------------------------------------------------------------------
+
+# Tinhte and Voz serve server-rendered XenForo HTML. We parse it with the stdlib
+# html.parser instead of a headless browser. This is best-effort: if a page is
+# Cloudflare-gated or the markup changes, fetch/parse fails → CrawlError →
+# load_fallback(). That is the intended degraded-mode behaviour for these two.
+
+
+class _LinkCollector(HTMLParser):
+    """Collect every (href, link_text) pair from <a> tags in a page."""
+
+    def __init__(self):
+        super().__init__()
+        self.links: list[tuple[str, str]] = []
+        self._href = None
+        self._text: list[str] = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "a":
+            # Flush any unterminated anchor before starting a new one
+            if self._href is not None:
+                self.links.append((self._href, "".join(self._text).strip()))
+            self._href = dict(attrs).get("href")
+            self._text = []
+
+    def handle_endtag(self, tag):
+        if tag == "a" and self._href is not None:
+            self.links.append((self._href, "".join(self._text).strip()))
+            self._href = None
+            self._text = []
+
+    def handle_data(self, data):
+        if self._href is not None:
+            self._text.append(data)
+
+
+class _XenForoMessageParser(HTMLParser):
+    """
+    Extract posts from XenForo `<article class="message ..." data-author="...">`
+    blocks. Author comes from the `data-author` attribute; body text from the
+    first `<div class="bbWrapper">`; date from the first `<time datetime="...">`.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.messages: list[dict] = []
+        self._article_level = 0          # 0 = not inside a message article
+        self._author = None
+        self._date = None
+        self._parts: list[str] = []
+        self._in_body = False
+        self._body_div_level = 0
+
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+        classes = (a.get("class") or "").split()
+
+        if tag == "article" and "message" in classes:
+            # Start of a (top-level) message
+            self._article_level = 1
+            self._author = a.get("data-author")
+            self._date = None
+            self._parts = []
+            self._in_body = False
+            self._body_div_level = 0
+            return
+
+        if self._article_level == 0:
+            return
+
+        if tag == "article":
+            self._article_level += 1
+
+        if tag == "time" and self._date is None and a.get("datetime"):
+            self._date = a.get("datetime")
+
+        if tag == "div" and not self._in_body and "bbWrapper" in classes:
+            self._in_body = True
+            self._body_div_level = 1
+            return
+
+        if self._in_body and tag == "div":
+            self._body_div_level += 1
+
+    def handle_endtag(self, tag):
+        if self._article_level == 0:
+            return
+
+        if self._in_body and tag == "div":
+            self._body_div_level -= 1
+            if self._body_div_level == 0:
+                self._in_body = False
+            return
+
+        if tag == "article":
+            self._article_level -= 1
+            if self._article_level == 0:
+                content = re.sub(r"\s+", " ", "".join(self._parts)).strip()
+                if content:
+                    self.messages.append({
+                        "author": (self._author or "anonymous").strip(),
+                        "content": content,
+                        "date": self._date,
+                    })
+                self._author = None
+                self._date = None
+                self._parts = []
+                self._in_body = False
+                self._body_div_level = 0
+
+    def handle_data(self, data):
+        if self._article_level and self._in_body:
+            self._parts.append(data)
+
+
+def _absolute(base: str, href: str) -> str:
+    return href if href.startswith("http") else base + href
 
 
 # ---------------------------------------------------------------------------
-# Shared crawl4ai config (used by both Tinhte and Voz)
+# 5. Tinhte.vn  —  static XenForo HTML (stdlib)
 # ---------------------------------------------------------------------------
-
-def _make_browser_config():
-    from crawl4ai import BrowserConfig
-
-    return BrowserConfig(
-        headless=True,
-        browser_type="chromium",
-    )
-
-
-def _make_run_config(
-    wait_for: str = None,
-    extraction_strategy=None,
-    css_selector: str = None,
-    page_timeout: int = 30_000,
-    mean_delay: float = 1.5,
-):
-    from crawl4ai import CacheMode, CrawlerRunConfig
-
-    return CrawlerRunConfig(
-        cache_mode=CacheMode.BYPASS,          # Always fetch fresh
-        magic=True,                            # Auto anti-bot: hides automation signals
-        simulate_user=True,                    # Human-like mouse/scroll behavior
-        override_navigator=True,               # Spoof navigator.webdriver
-        remove_consent_popups=True,            # Auto-dismiss cookie banners
-        scan_full_page=True,                   # Scroll full page for lazy-loaded content
-        user_agent_mode="random",              # Rotate user agents per request
-        page_timeout=page_timeout,
-        wait_for=wait_for,
-        extraction_strategy=extraction_strategy,
-        css_selector=css_selector,
-        mean_delay=mean_delay,                 # Randomized inter-action delay
-        max_range=0.5,                         # ± 0.5s jitter on mean_delay
-        verbose=False,
-    )
-
-
-def _run_async(coro):
-    """Run an async coroutine from sync context safely."""
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            # Already inside an event loop (e.g. Jupyter) — use nest_asyncio
-            import nest_asyncio
-            nest_asyncio.apply()
-            return loop.run_until_complete(coro)
-    except RuntimeError:
-        pass
-    return asyncio.run(coro)
-
-
-# ---------------------------------------------------------------------------
-# 5. Tinhte.vn  —  crawl4ai
-# ---------------------------------------------------------------------------
-
-# Structured extraction schemas for Tinhte
-_TINHTE_SEARCH_SCHEMA = {
-    "name": "TinhteSearchResults",
-    "baseSelector": "div.contentRow",
-    "fields": [
-        {"name": "title",   "selector": "h3.contentRow-title a, a.contentRow-title", "type": "text"},
-        {"name": "href",    "selector": "h3.contentRow-title a, a.contentRow-title", "type": "attribute", "attribute": "href"},
-        {"name": "date",    "selector": "time",                                       "type": "attribute", "attribute": "datetime"},
-        {"name": "snippet", "selector": "div.contentRow-snippet",                     "type": "text"},
-    ],
-}
-
-_TINHTE_POST_SCHEMA = {
-    "name": "TinhtePost",
-    "baseSelector": "article.message",
-    "fields": [
-        {"name": "author",  "selector": "a.username, span.username",                  "type": "text"},
-        {"name": "content", "selector": "div.bbWrapper, div.message-body",            "type": "text"},
-        {"name": "date",    "selector": "time",                                       "type": "attribute", "attribute": "datetime"},
-    ],
-}
-
 
 class TinhteCrawler(BaseCrawler):
     """
-    Tinhte.vn crawler using crawl4ai (Playwright-based).
+    Tinhte.vn crawler over server-rendered XenForo HTML (stdlib urllib).
 
-    Improvements over requests+BeautifulSoup:
-    - Renders JS-heavy pages (lazy-loaded content, login walls)
-    - magic=True + simulate_user: bypasses Cloudflare/bot detection
-    - JsonCssExtractionStrategy: structured, resilient extraction
-    - arun_many(): concurrent post fetching (3–4× faster)
+    Phase A — fetch search result pages, collect thread URLs
+    Phase B — fetch each thread, extract messages (author/content/date)
+
+    Best-effort: Tinhte sometimes Cloudflare-gates search. On failure the base
+    class falls back to the dataset, so the pipeline never crashes.
     """
     BASE_URL = "https://tinhte.vn"
+    _THREAD_RE = re.compile(r"/threads?/[\w\-]+\.\d+")
 
-    def __init__(self, search_query: str, max_pages: int = 5, max_concurrent: int = 4, **kwargs):
+    def __init__(self, search_query: str, max_pages: int = 5,
+                 max_threads: int = 25, **kwargs):
         super().__init__(source_name="tinhte", **kwargs)
         self.search_query = search_query
         self.max_pages = max_pages
-        self.max_concurrent = max_concurrent  # Concurrent post page fetches
+        self.max_threads = max_threads
 
-    async def _async_crawl(self) -> list:
-        from crawl4ai import AsyncWebCrawler
-        from crawl4ai.extraction_strategy import JsonCssExtractionStrategy
+    def _discover_threads(self) -> dict:
+        """Return {thread_url: title} discovered from search pages."""
+        found: dict[str, str] = {}
+        for page in range(1, self.max_pages + 1):
+            url = f"{self.BASE_URL}/search?q={quote(self.search_query)}&t=post&p={page}"
+            html = self.fetch_with_retry(_http_get_text, url)
+            collector = _LinkCollector()
+            collector.feed(html)
+            new_this_page = 0
+            for href, text in collector.links:
+                if not href or not self._THREAD_RE.search(href):
+                    continue
+                thread_url = _absolute(self.BASE_URL, self._THREAD_RE.search(href).group(0) + "/")
+                if thread_url not in found:
+                    found[thread_url] = text
+                    new_this_page += 1
+            if new_this_page == 0:
+                break
+            time.sleep(1.5)
+        return found
 
-        browser_cfg = _make_browser_config()
+    def crawl(self) -> list:
         results = []
-        seen_urls = set()
-        post_urls_meta = []  # (post_url, title, snippet, date_from_search)
+        threads = self._discover_threads()
+        logger.info("[tinhte] Discovered %d unique threads", len(threads))
 
-        async with AsyncWebCrawler(config=browser_cfg) as crawler:
+        for thread_url, title in list(threads.items())[:self.max_threads]:
+            try:
+                html = self.fetch_with_retry(_http_get_text, thread_url)
+            except CrawlError as e:
+                logger.debug("[tinhte] Thread fetch failed %s: %s", thread_url, e)
+                continue
 
-            # ── Phase A: Collect post URLs from search results ──────────────
-            search_cfg = _make_run_config(
-                wait_for="css:div.contentRow",
-                extraction_strategy=JsonCssExtractionStrategy(_TINHTE_SEARCH_SCHEMA),
-            )
-            for page in range(1, self.max_pages + 1):
-                url = f"{self.BASE_URL}/search?q={quote(self.search_query)}&t=post&p={page}"
-                result = await crawler.arun(url=url, config=search_cfg)
+            parser = _XenForoMessageParser()
+            parser.feed(html)
 
-                if not result.success:
-                    logger.warning("[tinhte] Search page %d failed: %s", page, result.error_message)
-                    break
-
-                try:
-                    rows = json.loads(result.extracted_content or "[]")
-                except (json.JSONDecodeError, TypeError):
-                    rows = []
-
-                if not rows:
-                    break
-
-                for row in rows:
-                    href = row.get("href", "")
-                    if not href:
-                        continue
-                    post_url = href if href.startswith("http") else self.BASE_URL + href
-                    if post_url in seen_urls:
-                        continue
-                    seen_urls.add(post_url)
-                    post_urls_meta.append((
-                        post_url,
-                        row.get("title", "").strip(),
-                        row.get("snippet", "").strip(),
-                        row.get("date"),
-                    ))
-
-            logger.info("[tinhte] Discovered %d unique posts", len(post_urls_meta))
-
-            # ── Phase B: Fetch post content concurrently ─────────────────────
-            post_cfg = _make_run_config(
-                wait_for="css:article.message, div.bbWrapper",
-                extraction_strategy=JsonCssExtractionStrategy(_TINHTE_POST_SCHEMA),
-                mean_delay=2.0,
-            )
-            urls_only = [u for u, *_ in post_urls_meta]
-            meta_map = {u: (t, s, d) for u, t, s, d in post_urls_meta}
-
-            # arun_many handles concurrency + rate limiting internally
-            responses = await crawler.arun_many(urls=urls_only, config=post_cfg)
-
-            for resp in responses:
-                post_url = resp.url
-                title, snippet, search_date = meta_map.get(post_url, ("", "", None))
-
-                if not resp.success:
-                    logger.debug("[tinhte] Post fetch failed %s: %s", post_url, resp.error_message)
-                    # Fallback: use snippet from search
-                    if snippet:
-                        results.append(_make_review(
-                            source="tinhte", app=self.app_name,
-                            author="anonymous", rating=None,
-                            content=f"{title}. {snippet}",
-                            date=search_date, url=post_url,
-                            metadata={"thread_title": title},
-                        ))
+            for msg in parser.messages:
+                content = msg["content"]
+                if not content:
                     continue
-
-                try:
-                    messages = json.loads(resp.extracted_content or "[]")
-                except (json.JSONDecodeError, TypeError):
-                    messages = []
-
-                if not messages:
-                    # Use clean markdown as fallback if CSS extraction misses
-                    content = resp.markdown or snippet
-                    if content:
-                        results.append(_make_review(
-                            source="tinhte", app=self.app_name,
-                            author="anonymous", rating=None,
-                            content=f"{title}. {content[:2000]}",
-                            date=search_date, url=post_url,
-                            metadata={"thread_title": title},
-                        ))
-                    continue
-
-                for msg in messages:
-                    content = (msg.get("content") or "").strip()
-                    if not content:
-                        continue
-                    results.append(_make_review(
-                        source="tinhte", app=self.app_name,
-                        author=(msg.get("author") or "anonymous").strip(),
-                        rating=None,
-                        content=f"{title}. {content}",
-                        date=msg.get("date") or search_date,
-                        url=post_url,
-                        metadata={"thread_title": title},
-                    ))
+                results.append(_make_review(
+                    source="tinhte", app=self.app_name,
+                    author=msg["author"],
+                    rating=None,
+                    content=f"{title}. {content}" if title else content,
+                    date=msg["date"],
+                    url=thread_url,
+                    metadata={"thread_title": title},
+                ))
+            time.sleep(2)
 
         logger.info("[tinhte] Fetched %d posts for query: %s", len(results), self.search_query)
         return results
 
-    def crawl(self) -> list:
-        return _run_async(self._async_crawl())
-
 
 # ---------------------------------------------------------------------------
-# 6. Voz.vn  —  crawl4ai
+# 6. Voz.vn  —  static XenForo HTML (stdlib)
 # ---------------------------------------------------------------------------
-
-_VOZ_SEARCH_SCHEMA = {
-    "name": "VozSearchResults",
-    "baseSelector": "li.block-row",
-    "fields": [
-        {"name": "title", "selector": "h3.contentRow-title a", "type": "text"},
-        {"name": "href",  "selector": "h3.contentRow-title a", "type": "attribute", "attribute": "href"},
-        {"name": "date",  "selector": "time.u-dt",             "type": "attribute", "attribute": "datetime"},
-    ],
-}
-
-_VOZ_THREAD_SCHEMA = {
-    "name": "VozThreadMessages",
-    "baseSelector": "article.message",
-    "fields": [
-        {"name": "author",  "selector": "a.username",          "type": "text"},
-        {"name": "content", "selector": "div.bbWrapper",       "type": "text"},
-        {"name": "date",    "selector": "time.u-dt",           "type": "attribute", "attribute": "datetime"},
-        {"name": "likes",   "selector": "a.reactionsBar-link", "type": "attribute", "attribute": "title"},
-    ],
-}
-
 
 class VozCrawler(BaseCrawler):
     """
-    Voz.vn crawler using crawl4ai (Playwright-based).
+    Voz.vn crawler over server-rendered XenForo HTML (stdlib urllib).
 
-    Voz uses XenForo — same engine as Tinhte but different selectors.
-    Key improvement: arun_many() fetches all thread pages concurrently,
-    cutting crawl time from ~O(threads × pages × 2s) to ~O(pages × 2s).
+    Voz uses the same XenForo engine as Tinhte (different thread URL shape: /t/).
+    Threads paginate as /t/<slug>.<id>/page-2/ etc.
     """
     BASE_URL = "https://voz.vn"
+    _THREAD_RE = re.compile(r"/t/[\w\-]+\.\d+")
 
     def __init__(self, search_query: str, max_pages: int = 5,
-                 max_thread_pages: int = 3, max_concurrent: int = 4, **kwargs):
+                 max_thread_pages: int = 3, max_threads: int = 20, **kwargs):
         super().__init__(source_name="voz", **kwargs)
         self.search_query = search_query
         self.max_pages = max_pages
         self.max_thread_pages = max_thread_pages
-        self.max_concurrent = max_concurrent
+        self.max_threads = max_threads
 
     def _normalize_thread_url(self, href: str) -> str:
-        """Strip post anchors and ensure absolute URL."""
-        url = re.sub(r'/post-\d+/?$', '/', href)
-        url = url if url.startswith("http") else self.BASE_URL + url
+        """Strip post anchors / page suffixes and ensure an absolute, trailing-slash URL."""
+        match = self._THREAD_RE.search(href)
+        path = match.group(0) if match else href
+        url = _absolute(self.BASE_URL, path)
         if not url.endswith("/"):
             url += "/"
         return url
 
-    async def _async_crawl(self) -> list:
-        from crawl4ai import AsyncWebCrawler
-        from crawl4ai.extraction_strategy import JsonCssExtractionStrategy
-
-        browser_cfg = _make_browser_config()
-        results = []
-        seen_threads = set()
-        thread_meta: dict[str, str] = {}  # url → title
-
-        async with AsyncWebCrawler(config=browser_cfg) as crawler:
-
-            # ── Phase A: Discover thread URLs from search ────────────────────
-            search_cfg = _make_run_config(
-                wait_for="css:li.block-row",
-                extraction_strategy=JsonCssExtractionStrategy(_VOZ_SEARCH_SCHEMA),
-            )
-            for page in range(1, self.max_pages + 1):
-                url = (f"{self.BASE_URL}/search/"
-                       f"?q={quote(self.search_query)}&type=post&page={page}")
-                result = await crawler.arun(url=url, config=search_cfg)
-
-                if not result.success:
-                    logger.warning("[voz] Search page %d failed: %s", page, result.error_message)
-                    break
-
-                try:
-                    rows = json.loads(result.extracted_content or "[]")
-                except (json.JSONDecodeError, TypeError):
-                    rows = []
-
-                if not rows:
-                    break
-
-                for row in rows:
-                    href = row.get("href", "")
-                    if not href:
-                        continue
-                    thread_url = self._normalize_thread_url(href)
-                    if thread_url in seen_threads:
-                        continue
-                    seen_threads.add(thread_url)
-                    thread_meta[thread_url] = row.get("title", "").strip()
-
-            logger.info("[voz] Discovered %d unique threads", len(seen_threads))
-
-            # ── Phase B: Build all page URLs for all threads ─────────────────
-            # e.g. thread with 3 pages → 3 URLs to fetch
-            all_page_urls = []
-            for t_url in seen_threads:
-                all_page_urls.append(t_url)  # page 1
-                for pg in range(2, self.max_thread_pages + 1):
-                    all_page_urls.append(f"{t_url}page-{pg}/")
-
-            # ── Phase C: Fetch all thread pages concurrently ─────────────────
-            thread_cfg = _make_run_config(
-                wait_for="css:article.message",
-                extraction_strategy=JsonCssExtractionStrategy(_VOZ_THREAD_SCHEMA),
-                mean_delay=2.0,
-            )
-            responses = await crawler.arun_many(urls=all_page_urls, config=thread_cfg)
-
-            for resp in responses:
-                # Resolve back to thread root for metadata lookup
-                thread_root = self._normalize_thread_url(
-                    re.sub(r'page-\d+/$', '', resp.url)
-                )
-                title = thread_meta.get(thread_root, "")
-
-                if not resp.success:
-                    # 404 = thread page doesn't exist (normal for last page) — skip quietly
-                    if "404" not in str(resp.error_message):
-                        logger.debug("[voz] Thread page failed %s: %s", resp.url, resp.error_message)
+    def _discover_threads(self) -> dict:
+        """Return {thread_root_url: title} discovered from search pages."""
+        found: dict[str, str] = {}
+        for page in range(1, self.max_pages + 1):
+            url = (f"{self.BASE_URL}/search/"
+                   f"?q={quote(self.search_query)}&type=post&page={page}")
+            html = self.fetch_with_retry(_http_get_text, url)
+            collector = _LinkCollector()
+            collector.feed(html)
+            new_this_page = 0
+            for href, text in collector.links:
+                if not href or not self._THREAD_RE.search(href):
                     continue
+                thread_url = self._normalize_thread_url(href)
+                if thread_url not in found:
+                    found[thread_url] = text
+                    new_this_page += 1
+            if new_this_page == 0:
+                break
+            time.sleep(1.5)
+        return found
 
+    def crawl(self) -> list:
+        results = []
+        threads = self._discover_threads()
+        logger.info("[voz] Discovered %d unique threads", len(threads))
+
+        for thread_url, title in list(threads.items())[:self.max_threads]:
+            for pg in range(1, self.max_thread_pages + 1):
+                page_url = thread_url if pg == 1 else f"{thread_url}page-{pg}/"
                 try:
-                    messages = json.loads(resp.extracted_content or "[]")
-                except (json.JSONDecodeError, TypeError):
-                    messages = []
+                    html = self.fetch_with_retry(_http_get_text, page_url)
+                except CrawlError as e:
+                    # Last page of a thread 404s — that's expected, stop paging
+                    logger.debug("[voz] Thread page failed %s: %s", page_url, e)
+                    break
 
-                for msg in messages:
-                    content = (msg.get("content") or "").strip()
+                parser = _XenForoMessageParser()
+                parser.feed(html)
+                if not parser.messages:
+                    break  # no more posts on this/subsequent pages
+
+                for msg in parser.messages:
+                    content = msg["content"]
                     if not content:
                         continue
-
-                    # Parse like count from e.g. "12 people reacted" → 12
-                    likes_raw = msg.get("likes") or "0"
-                    try:
-                        likes = int(re.match(r"(\d[\d,]*)", likes_raw).group(1).replace(",", ""))
-                    except (AttributeError, ValueError):
-                        likes = 0
-
                     results.append(_make_review(
                         source="voz", app=self.app_name,
-                        author=(msg.get("author") or "anonymous").strip(),
+                        author=msg["author"],
                         rating=None,
                         content=content,
-                        date=msg.get("date"),
-                        url=thread_root,
-                        metadata={"thread_title": title, "like_count": likes},
+                        date=msg["date"],
+                        url=thread_url,
+                        metadata={"thread_title": title, "like_count": None},
                     ))
+                time.sleep(2)
 
         logger.info("[voz] Fetched %d posts for query: %s", len(results), self.search_query)
         return results
-
-    def crawl(self) -> list:
-        return _run_async(self._async_crawl())

@@ -36,18 +36,17 @@ result, _ = reviews(
 
 ## 2. Apple App Store
 
-**Method**: `app-store-scraper` Python library OR iTunes RSS feed (no API key needed)
+**Method**: iTunes RSS customer-reviews feed (clean JSON, no API key) fetched with the **Python standard library** (`urllib.request`). No `app-store-scraper`, no `requests`.
 
 ```python
-from app_store_scraper import AppStore
-
-app = AppStore(country="vn", app_name="zalopay", app_id="1107454800")
-app.review(how_many=500)
-reviews = app.reviews  # list of dicts
+import json, urllib.request
+url = (f"https://itunes.apple.com/rss/customerreviews/id={app_id}"
+       f"/sortBy=mostRecent/json?country=vn&limit=50&page={page}")
+with urllib.request.urlopen(urllib.request.Request(url), timeout=20) as resp:
+    entries = json.load(resp).get("feed", {}).get("entry", [])
 ```
 
-**Alternative (RSS)**: `https://itunes.apple.com/rss/customerreviews/id={app_id}/sortBy=mostRecent/json?country=vn&limit=50`
-- Paginate by appending `&page=2`, `&page=3`, etc. — stops returning at page ~10 (Apple hard limit ~500 reviews via RSS)
+**Pagination**: append `&page=2`, `&page=3`, … — stops returning at page ~10 (Apple hard limit ~500 reviews via RSS). For deeper history a third-party scraper would be needed, but RSS covers the recency window this skill targets.
 
 **Fields available**: `title`, `review` (content), `rating`, `userName`, `date`
 
@@ -106,16 +105,19 @@ video_ids = [entry["id"] for entry in result["entries"]]
 
 ## 4. Reddit
 
-**Method**: PRAW (Python Reddit API Wrapper) — requires client_id + client_secret, OR use `requests` against the public JSON API (no auth needed for read-only)
+**Method**: Public `.json` API via the **Python standard library** (`urllib.request`). No PRAW, no `requests`, no OAuth, no headless browser. Reddit exposes a read-only JSON view of any listing by appending `.json` to its URL.
 
-### No-auth approach (preferred for portability)
+### No-auth, no-install approach (stdlib only)
 ```python
-import requests
-headers = {"User-Agent": "ReviewBot/1.0"}
-url = f"https://www.reddit.com/search.json?q={query}&sort=new&limit=100&t=year"
-resp = requests.get(url, headers=headers)
-posts = resp.json()["data"]["children"]
+import json, urllib.request
+req = urllib.request.Request(
+    f"https://www.reddit.com/search.json?q={query}&sort=new&limit=100&t=year",
+    headers={"User-Agent": "Mozilla/5.0 ... Chrome/124 Safari/537.36"},
+)
+with urllib.request.urlopen(req, timeout=20) as resp:
+    posts = json.load(resp)["data"]["children"]
 ```
+A descriptive/browser-like `User-Agent` is **required** — Reddit 429s the default Python UA. The crawler paginates with the `after` cursor and walks each post's comment tree via `{permalink}.json` (the `replies` field nests recursively).
 
 ### Key subreddits to search
 - `r/VietNam`, `r/vietnam` — general VN discussions
@@ -138,96 +140,39 @@ url = f"https://www.reddit.com/r/{subreddit}/comments/{post_id}.json?limit=200"
 
 ---
 
-## 5. Tinhte.vn — crawl4ai
+## 5. Tinhte.vn — static XenForo HTML (stdlib)
 
-**Method**: `crawl4ai` with Playwright (Chromium). Replaces `requests+BeautifulSoup`.
+**Method**: `urllib.request` (stdlib) to fetch server-rendered XenForo HTML, parsed with `html.parser` (stdlib). **No browser engine** — crawl4ai/Playwright was removed to keep the skill installable in restricted environments.
 
-**Why crawl4ai here**: Tinhte uses JS-rendered lazy loading and Cloudflare protection. A plain HTTP client gets bot-blocked or returns incomplete HTML.
+**Trade-off**: Tinhte occasionally Cloudflare-gates its search page. When that happens the fetch raises, retries exhaust, and the crawler falls back to the dataset (see SKILL.md → Retry & Fallback). This is **best-effort live crawling** — expect Tinhte to fall back more often than the JSON-API sources.
 
-### Config used
-```python
-BrowserConfig(headless=True, browser_type="chromium")
+### Strategy
+1. **Phase A — discover threads**: GET `https://tinhte.vn/search?q={query}&t=post&p={page}`. A stdlib `HTMLParser` collects every `<a href>`; threads are the hrefs matching `/threads?/<slug>.<id>`.
+2. **Phase B — fetch each thread**: GET the thread URL and parse posts.
 
-CrawlerRunConfig(
-    cache_mode=CacheMode.BYPASS,
-    magic=True,            # Hides automation signals (navigator.webdriver etc.)
-    simulate_user=True,    # Human-like mouse + scroll behavior
-    override_navigator=True,
-    remove_consent_popups=True,
-    scan_full_page=True,   # Auto-scrolls for lazy-loaded content
-    user_agent_mode="random",
-    extraction_strategy=JsonCssExtractionStrategy(schema),
-)
-```
+### Post extraction (stdlib HTMLParser)
+XenForo posts are `<article class="message ..." data-author="username">` blocks:
+- **author** ← the `data-author` attribute on the `<article>` (most stable signal)
+- **content** ← text inside the first `<div class="bbWrapper">` (div-depth tracked so nested quotes don't end it early)
+- **date** ← the first `<time datetime="...">` inside the article
 
-### Search extraction schema
-```python
-{
-    "baseSelector": "div.contentRow",
-    "fields": [
-        {"name": "title",   "selector": "h3.contentRow-title a", "type": "text"},
-        {"name": "href",    "selector": "h3.contentRow-title a", "type": "attribute", "attribute": "href"},
-        {"name": "date",    "selector": "time",                   "type": "attribute", "attribute": "datetime"},
-        {"name": "snippet", "selector": "div.contentRow-snippet", "type": "text"},
-    ]
-}
-```
-
-### Post content extraction schema
-```python
-{
-    "baseSelector": "article.message",
-    "fields": [
-        {"name": "author",  "selector": "a.username, span.username",       "type": "text"},
-        {"name": "content", "selector": "div.bbWrapper, div.message-body", "type": "text"},
-        {"name": "date",    "selector": "time",                            "type": "attribute", "attribute": "datetime"},
-    ]
-}
-```
-
-### Concurrent fetching
-Post pages are batched via `arun_many()` — all discovered post URLs are fetched concurrently (up to `max_concurrent=4`), reducing total crawl time by ~3–4×.
-
-**Fallback**: If `extracted_content` is empty (selector miss), the crawler falls back to `result.markdown` — crawl4ai's clean-text rendering of the page.
+No CSS-selector library is needed — the parser keys off `data-author` + `bbWrapper`, which both Tinhte and Voz share.
 
 **No rating**: Tinhte has no star rating — `rating: null`.
 
 ---
 
-## 6. Voz.vn — crawl4ai
+## 6. Voz.vn — static XenForo HTML (stdlib)
 
-**Method**: `crawl4ai` with Playwright. Same approach as Tinhte (both XenForo-based).
+**Method**: Same stdlib approach as Tinhte (`urllib.request` + `html.parser`). Voz runs the same XenForo engine — only the thread URL shape differs (`/t/<slug>.<id>/` instead of `/threads/`).
 
-**Why crawl4ai here**: Voz has aggressive anti-bot on search pages and loads thread content dynamically. Also subject to login walls for some content.
+**Trade-off**: Voz has aggressive anti-bot on its search page and login walls on some content, so live crawling is best-effort and falls back to the dataset when blocked.
 
-### Search extraction schema
-```python
-{
-    "baseSelector": "li.block-row",
-    "fields": [
-        {"name": "title", "selector": "h3.contentRow-title a", "type": "text"},
-        {"name": "href",  "selector": "h3.contentRow-title a", "type": "attribute", "attribute": "href"},
-        {"name": "date",  "selector": "time.u-dt",             "type": "attribute", "attribute": "datetime"},
-    ]
-}
-```
+### Strategy
+1. **Discover threads**: GET `https://voz.vn/search/?q={query}&type=post&page={page}`; collect hrefs matching `/t/<slug>.<id>`, normalized to the thread root (strip `/post-N` and `/page-N`).
+2. **Page through each thread**: thread root is page 1; subsequent pages are `{thread}/page-2/`, `/page-3/`, … An empty/404 page ends paging for that thread.
+3. **Extract posts**: identical XenForo parsing as Tinhte — `data-author` for the author, first `div.bbWrapper` for content, first `<time datetime>` for the date.
 
-### Thread message extraction schema
-```python
-{
-    "baseSelector": "article.message",
-    "fields": [
-        {"name": "author",  "selector": "a.username",          "type": "text"},
-        {"name": "content", "selector": "div.bbWrapper",       "type": "text"},
-        {"name": "date",    "selector": "time.u-dt",           "type": "attribute", "attribute": "datetime"},
-        {"name": "likes",   "selector": "a.reactionsBar-link", "type": "attribute", "attribute": "title"},
-    ]
-}
-```
-
-### Concurrent multi-page thread fetching
-All thread page URLs (`thread/`, `thread/page-2/`, `thread/page-3/`) are collected upfront and fed to `arun_many()` in one batch. 404s (non-existent pages) are handled silently.
-
-**Like count parsing**: `likes` attribute returns e.g. `"12 people reacted"` — parsed with regex `(\d[\d,]*)` → integer.
+**Like count**: not extracted in the stdlib version — `metadata.like_count` is `null`. (The old crawl4ai parser read it from `a.reactionsBar-link[title]`; reinstate via a targeted parser if you need it.)
 
 **No rating**: Voz has no star rating — `rating: null`.

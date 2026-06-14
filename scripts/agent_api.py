@@ -34,8 +34,14 @@ from scripts.sources import (
     RedditCrawler, TinhteCrawler, VozCrawler,
 )
 from scripts.pipeline import deduplicate, qualify, mark_near_duplicates
+from scripts import crawl_client
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_CRAWL_SERVICE_URL = (
+    "https://endpoint-503c0bb0-c12f-4b54-919d-edc2c10b633e."
+    "agentbase-runtime.aiplatform.vngcloud.vn"
+)
 
 # ---------------------------------------------------------------------------
 # App registry — pre-resolved IDs (mirrors references/fintech-apps.md)
@@ -154,7 +160,7 @@ async def _crawl_app(app_cfg: dict, sources: list, common_kwargs: dict) -> list:
     return all_reviews
 
 
-def _review_title(review: dict) -> str | None:
+def _review_title(review: dict):
     metadata = review.get("metadata") or {}
     return (
         metadata.get("video_title")
@@ -206,6 +212,11 @@ async def run_research(
     rating_max: int = 5,
     min_length: int = 30,
     allowed_langs: list[str] = None,
+    market: str = "VN",
+    crawl_service_url: str = None,
+    crawl_service_token: str = None,
+    crawl_service_timeout: int = 900,
+    crawl_filters: dict = None,
 ) -> dict:
     """
     Crawl reviews for one or more apps and return qualified results.
@@ -244,6 +255,28 @@ async def run_research(
         sources = DEFAULT_SOURCES
     if allowed_langs is None:
         allowed_langs = ["vi", "en"]
+
+    if crawl_service_url == "":
+        service_url = None
+    else:
+        service_url = crawl_service_url or os.getenv("REVIEW_CRAWLER_SERVICE_URL") or DEFAULT_CRAWL_SERVICE_URL
+    if service_url:
+        return await _run_delegated_research(
+            apps=apps,
+            goal=goal,
+            days_back=days_back,
+            sources=sources,
+            focus_area=focus_area,
+            rating_min=rating_min,
+            rating_max=rating_max,
+            min_length=min_length,
+            allowed_langs=allowed_langs,
+            market=market,
+            crawl_service_url=service_url,
+            crawl_service_token=crawl_service_token or os.getenv("REVIEW_CRAWLER_SERVICE_TOKEN"),
+            crawl_service_timeout=crawl_service_timeout,
+            crawl_filters=crawl_filters,
+        )
 
     common_kwargs = dict(
         max_retries=max_retries,
@@ -318,3 +351,128 @@ async def run_research(
             "allowed_langs": allowed_langs,
         },
     }
+
+
+async def _run_delegated_research(
+    *,
+    apps: list[str],
+    goal: str,
+    days_back: int,
+    sources: list[str],
+    focus_area: str,
+    rating_min: int,
+    rating_max: int,
+    min_length: int,
+    allowed_langs: list[str],
+    market: str,
+    crawl_service_url: str,
+    crawl_service_token: str,
+    crawl_service_timeout: int,
+    crawl_filters: dict,
+) -> dict:
+    all_reviews = []
+    reviews_by_app = {}
+    stats = {}
+    service_results = {}
+
+    for app_name in apps:
+        app_cfg = _resolve_app(app_name)
+        display_name = app_cfg["display_name"]
+        filters = {
+            "min_length": min_length,
+            "allowed_langs": allowed_langs,
+        }
+        if crawl_filters:
+            filters.update(crawl_filters)
+        discovered_targets_path = os.getenv("REVIEW_CRAWLER_DISCOVERED_TARGETS_PATH")
+        if discovered_targets_path and "discovered_targets_path" not in filters:
+            filters["discovered_targets_path"] = discovered_targets_path
+
+        service_payload = await crawl_client.crawl_reviews(
+            base_url=crawl_service_url,
+            subject=display_name,
+            market=market,
+            goal=goal,
+            focus=focus_area,
+            sources=sources or DEFAULT_SOURCES,
+            rating_min=rating_min,
+            rating_max=rating_max,
+            days_back=days_back,
+            filters=filters,
+            token=crawl_service_token,
+            max_wait_seconds=crawl_service_timeout,
+        )
+
+        service_reviews = []
+        for review in service_payload.get("reviews", []):
+            if not review.get("qualified"):
+                continue
+            normalized = dict(review)
+            normalized["app"] = normalized.get("app") or display_name
+            normalized["subject"] = normalized.get("subject") or display_name
+            service_reviews.append(normalized)
+
+        reviews_by_app[display_name] = service_reviews
+        all_reviews.extend(service_reviews)
+        stats[display_name] = _service_stats(service_payload, service_reviews)
+        service_results[display_name] = {
+            "stats": service_payload.get("stats", {}),
+            "outcomes": service_payload.get("outcomes", []),
+            "references": service_payload.get("references", []),
+        }
+
+    if focus_area:
+        kw = focus_area.lower()
+
+        def _sort_key(review):
+            return 0 if kw in (review.get("content") or "").lower() else 1
+
+        all_reviews = sorted(all_reviews, key=_sort_key)
+        for app_name in reviews_by_app:
+            reviews_by_app[app_name] = sorted(reviews_by_app[app_name], key=_sort_key)
+
+    return {
+        "apps": [_resolve_app(a)["display_name"] for a in apps],
+        "goal": goal,
+        "focus_area": focus_area,
+        "reviews": all_reviews,
+        "reviews_by_app": reviews_by_app,
+        "reviews_by_source": _reviews_by_source(all_reviews),
+        "references": _build_references(all_reviews),
+        "stats": stats,
+        "service_results": service_results,
+        "params": {
+            "days_back": days_back,
+            "sources": sources,
+            "rating_min": rating_min,
+            "rating_max": rating_max,
+            "min_length": min_length,
+            "allowed_langs": allowed_langs,
+            "market": market,
+            "crawl_service_url": crawl_service_url,
+            "crawl_filters": crawl_filters or {},
+        },
+    }
+
+
+def _service_stats(service_payload: dict, reviews: list) -> dict:
+    raw_total = 0
+    by_source = {}
+    for source, source_stats in (service_payload.get("stats") or {}).items():
+        if isinstance(source_stats, dict):
+            raw_total += int(source_stats.get("raw") or 0)
+    for review in reviews:
+        source = review.get("source")
+        by_source[source] = by_source.get(source, 0) + 1
+    return {
+        "total": raw_total or len(service_payload.get("reviews", [])),
+        "qualified": len(reviews),
+        "by_source": by_source,
+    }
+
+
+def _reviews_by_source(reviews: list) -> dict:
+    grouped = {}
+    for review in reviews:
+        grouped.setdefault(review.get("source"), []).append(review)
+    return grouped

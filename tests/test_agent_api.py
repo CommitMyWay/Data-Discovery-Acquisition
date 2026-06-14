@@ -12,6 +12,7 @@ class AgentApiTests(unittest.TestCase):
     def tearDown(self):
         for name in [
             "scripts.agent_api",
+            "scripts.crawl_client",
             "scripts.sources",
             "scripts.sources.__init__",
         ]:
@@ -66,6 +67,7 @@ class AgentApiTests(unittest.TestCase):
                     goal="product",
                     days_back=30,
                     sources=["youtube"],
+                    crawl_service_url="",
                 )
             )
 
@@ -82,6 +84,101 @@ class AgentApiTests(unittest.TestCase):
                 }
             ],
         )
+
+    def test_run_research_delegates_to_review_crawler_service(self):
+        agent_api = importlib.import_module("scripts.agent_api")
+        service_payload = {
+            "subject": "ZaloPay",
+            "market": "VN",
+            "goal": "qa",
+            "focus": "OTP",
+            "reviews": [
+                {
+                    "id": "sha256:delegated",
+                    "source": "google_play",
+                    "subject": "ZaloPay",
+                    "author": "user2",
+                    "rating": 1,
+                    "content": "OTP fails every time I try to login and complete payment.",
+                    "date": "2026-06-02",
+                    "url": "https://play.google.com/store/apps/details?id=x",
+                    "language": "en",
+                    "qualified": True,
+                    "disqualification_reasons": [],
+                    "metadata": {},
+                }
+            ],
+            "references": [
+                {
+                    "source": "google_play",
+                    "url": "https://play.google.com/store/apps/details?id=x",
+                }
+            ],
+            "stats": {"google_play": {"raw": 1, "qualified": 1}},
+            "outcomes": [{"source": "google_play", "result": "success"}],
+        }
+
+        async def fake_crawl_reviews(**kwargs):
+            self.assertEqual(kwargs["base_url"], "http://crawler.test")
+            self.assertEqual(kwargs["subject"], "ZaloPay")
+            self.assertEqual(kwargs["market"], "VN")
+            self.assertEqual(kwargs["goal"], "qa")
+            self.assertEqual(kwargs["focus"], "OTP")
+            self.assertEqual(kwargs["sources"], ["google_play"])
+            self.assertEqual(kwargs["filters"]["extra"], "value")
+            return dict(service_payload)
+
+        with mock.patch("scripts.crawl_client.crawl_reviews", side_effect=fake_crawl_reviews):
+            result = agent_api.asyncio.run(
+                agent_api.run_research(
+                    apps=["ZaloPay"],
+                    goal="qa",
+                    days_back=30,
+                    sources=["google_play"],
+                    focus_area="OTP",
+                    crawl_service_url="http://crawler.test",
+                    crawl_filters={"extra": "value"},
+                )
+            )
+
+        self.assertEqual(result["reviews"][0]["app"], "ZaloPay")
+        self.assertEqual(result["reviews_by_app"]["ZaloPay"][0]["id"], "sha256:delegated")
+        self.assertEqual(result["stats"]["ZaloPay"]["qualified"], 1)
+        self.assertEqual(result["service_results"]["ZaloPay"]["outcomes"][0]["result"], "success")
+
+    def test_run_research_uses_deployed_crawler_service_by_default(self):
+        agent_api = importlib.import_module("scripts.agent_api")
+        service_payload = {
+            "subject": "MoMo",
+            "market": "VN",
+            "goal": "qa",
+            "focus": None,
+            "reviews": [],
+            "references": [],
+            "stats": {},
+            "outcomes": [],
+        }
+
+        async def fake_crawl_reviews(**kwargs):
+            self.assertEqual(
+                kwargs["base_url"],
+                "https://endpoint-503c0bb0-c12f-4b54-919d-edc2c10b633e.agentbase-runtime.aiplatform.vngcloud.vn",
+            )
+            return dict(service_payload)
+
+        with mock.patch.dict("os.environ", {}, clear=True):
+            with mock.patch("scripts.crawl_client.crawl_reviews", side_effect=fake_crawl_reviews):
+                result = agent_api.asyncio.run(
+                    agent_api.run_research(
+                        apps=["MoMo"],
+                        goal="qa",
+                        days_back=30,
+                        sources=["voz"],
+                    )
+                )
+
+        self.assertEqual(result["apps"], ["MoMo"])
+        self.assertIn("MoMo", result["service_results"])
 
 
 if __name__ == "__main__":

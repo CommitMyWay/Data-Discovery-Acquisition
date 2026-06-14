@@ -15,7 +15,7 @@ description: >
 
 # User Review Aggregator — Vietnamese Fintech
 
-Collects, cleans, and qualifies user reviews for Vietnamese fintech/payment apps across 6 platforms in two phases: **Discovery** then **Crawl & Process**.
+Collects and analyses user reviews for Vietnamese fintech/payment apps across 6 platforms in three phases: **Discovery**, **Delegated Crawl**, then **Agent Analysis**.
 
 ## Phase 1 — Discovery
 
@@ -34,9 +34,19 @@ Given a target app (e.g. "ZaloPay"), identify the correct content handles for ea
 
 ---
 
-## Phase 2 — Crawl & Process
+## Phase 2 — Delegated Crawl
 
-Call `run_research()` from `agent_api.py`. It handles all sources, retry logic, fallback, dedup, and qualification — then returns structured data the agent reasons over directly.
+Call `run_research()` from `agent_api.py`. By default it delegates crawling to the deployed AgentBase `review-crawler-service` endpoint:
+
+`https://endpoint-503c0bb0-c12f-4b54-919d-edc2c10b633e.agentbase-runtime.aiplatform.vngcloud.vn`
+
+Set `crawl_service_url` or `REVIEW_CRAWLER_SERVICE_URL` only when you need to override that default, for example to test a local crawler.
+
+1. `POST /crawl` with the exact request shape this skill already produces.
+2. Poll `GET /crawl/{job_id}` until `completed` or `failed`.
+3. Convert the service payload back into the analysis-ready shape: `reviews`, `reviews_by_app`, `reviews_by_source`, `references`, `stats`.
+
+The skill does **not** crawl locally unless you explicitly pass `crawl_service_url=""` for offline tests. It only analyses the returned reviews.
 
 ```python
 import asyncio
@@ -45,14 +55,26 @@ from scripts.agent_api import run_research
 data = await run_research(
     apps=["ZaloPay"],                    # one or more apps
     goal="product",                      # product | marketing | qa
+    market="VN",
     days_back=180,
     focus_area="Login",                  # optional deep-dive topic
     sources=["google_play", "app_store", "youtube", "reddit", "tinhte", "voz"],
-    fallback_dataset_path="/path/to/fallback.json",  # optional
+    # crawl_service_url="http://localhost:8080",     # optional override
 )
 ```
 
 The agent then reads `data["reviews"]` and produces the analysis natively — no second API call needed.
+
+### Service configuration
+
+| Variable / Parameter | Purpose |
+|----------------------|---------|
+| `REVIEW_CRAWLER_SERVICE_URL` / `crawl_service_url` | Optional override for the hard-coded AgentBase endpoint, e.g. `http://localhost:8080` |
+| `REVIEW_CRAWLER_SERVICE_TOKEN` / `crawl_service_token` | Optional bearer token for protected AgentBase endpoints |
+| `REVIEW_CRAWLER_DISCOVERED_TARGETS_PATH` | Optional local smoke-test shortcut; points the service at a cached `discovered_targets.json` |
+| `market` | Market sent to the crawler service; default `VN` |
+| `crawl_service_timeout` | Max seconds to poll a job; default `900` |
+| `crawl_service_url=""` | Explicit opt-out for local/offline crawler tests |
 
 ### Key parameters
 | Parameter | Purpose |
@@ -62,8 +84,48 @@ The agent then reads `data["reviews"]` and produces the analysis natively — no
 | `days_back` | Recency window; default 180 |
 | `focus_area` | Optional topic to surface first (e.g. `"OTP"`, `"Thanh toán"`) |
 | `sources` | Omit any source to skip it |
-| `fallback_dataset_path` | JSON file used when a live source fails after retries |
+| `fallback_dataset_path` | Local-mode only: JSON file used when a live source fails after retries |
 | `rating_min` / `rating_max` | Filter by star rating; default 1–5 |
+
+### Local service smoke test
+
+From the repo root:
+
+```bash
+cd review-crawler-service
+/usr/bin/python3 -m pip install -r requirements.txt
+/usr/bin/python3 -m unittest discover -s tests
+/usr/bin/python3 -m uvicorn app.main:app --host 0.0.0.0 --port 8080
+```
+
+In another shell:
+
+```bash
+cd user-review-aggregator
+REVIEW_CRAWLER_SERVICE_URL=http://localhost:8080 \
+REVIEW_CRAWLER_DISCOVERED_TARGETS_PATH=/Users/la60716/PTO_Projects/hackathon_v2/momo-zalopay-crawl4ai/data/latest/discovered_targets.json \
+/usr/bin/python3 - <<'PY'
+import asyncio
+from scripts.agent_api import run_research
+
+async def main():
+    data = await run_research(
+        apps=["MoMo"],
+        goal="qa",
+        market="VN",
+        days_back=3650,
+        sources=["voz"],
+        focus_area="payment",
+        crawl_service_timeout=300,
+    )
+    print("apps:", data["apps"])
+    print("reviews:", len(data["reviews"]))
+    print("stats:", data["stats"])
+    print("service outcomes:", data["service_results"]["ZaloPay"]["outcomes"])
+
+asyncio.run(main())
+PY
+```
 
 ---
 
