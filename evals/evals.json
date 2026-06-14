@@ -1,0 +1,29 @@
+{
+  "skill_name": "user-review-aggregator",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "Tôi muốn thu thập tất cả đánh giá của người dùng về ứng dụng MoMo từ Google Play, App Store, Tinhte và Voz trong 12 tháng gần nhất. Chỉ lấy đánh giá tiếng Việt và tiếng Anh, bỏ qua review quá ngắn hoặc spam.",
+      "expected_output": "Run the full pipeline for MoMo across all 4 specified sources, with qualification filters applied (12 months recency, language: vi/en, min length, spam detection). Output JSON + summary report.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "I need to collect user feedback on ZaloPay from all available sources including YouTube comments and Reddit. The fallback dataset is at /data/zalopay_backup.json. Export results to output/zalopay_reviews.json and also a CSV.",
+      "expected_output": "Run 6-source crawl for ZaloPay using ZaloPay IDs from fintech-apps.md, reference fallback at /data/zalopay_backup.json, output both JSON and CSV.",
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "Collect bad reviews only (1-2 stars) for VNPay from Google Play and App Store. I want to focus on negative feedback to find the top pain points users report.",
+      "expected_output": "Run crawl for VNPay with --rating-max 2, sources limited to google_play and app_store. Qualification applies recency + spam filters. Output qualified reviews.",
+      "files": []
+    },
+    {
+      "id": 4,
+      "prompt": "Thu thập review ShopeePay từ Tinhte và Voz, lọc bỏ những bài quá cũ (chỉ lấy 6 tháng gần đây) và chỉ giữ review có chất lượng cao.",
+      "expected_output": "Run Tinhte + Voz crawlers for ShopeePay with --days-back 180, --only-qualified, and high_quality flag highlighted in output.",
+      "files": []
+    }
+  ]
+}
