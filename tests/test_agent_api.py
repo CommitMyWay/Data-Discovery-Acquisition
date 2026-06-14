@@ -5,20 +5,16 @@ import unittest
 from unittest import mock
 
 
-OPTIONAL_IMPORTS = {"requests", "bs4", "crawl4ai"}
+# These crawl-only deps must NOT be required to import the module anymore.
+OPTIONAL_IMPORTS = {"google_play_scraper", "yt_dlp", "requests", "bs4", "crawl4ai"}
 
 
 class AgentApiTests(unittest.TestCase):
     def tearDown(self):
-        for name in [
-            "scripts.agent_api",
-            "scripts.crawl_client",
-            "scripts.sources",
-            "scripts.sources.__init__",
-        ]:
+        for name in ["scripts.agent_api", "scripts.processing", "scripts.pipeline"]:
             sys.modules.pop(name, None)
 
-    def test_agent_api_import_does_not_require_optional_crawler_dependencies(self):
+    def test_import_does_not_require_crawl_dependencies(self):
         real_import = builtins.__import__
 
         def guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
@@ -34,11 +30,11 @@ class AgentApiTests(unittest.TestCase):
         with mock.patch("builtins.__import__", side_effect=guarded_import):
             module = importlib.import_module("scripts.agent_api")
 
-        self.assertTrue(hasattr(module, "run_research"))
+        self.assertTrue(hasattr(module, "process_reviews"))
 
-    def test_run_research_returns_references_for_qualified_reviews(self):
+    def test_process_reviews_qualifies_and_builds_references(self):
         agent_api = importlib.import_module("scripts.agent_api")
-        raw_review = {
+        raw = {
             "id": "sha256:test",
             "source": "youtube",
             "app": "ZaloPay",
@@ -47,9 +43,6 @@ class AgentApiTests(unittest.TestCase):
             "content": "Đăng nhập OTP thường xuyên lỗi khi thanh toán tại quầy sau khi cập nhật ứng dụng.",
             "date": "2026-06-01T00:00:00+00:00",
             "url": "https://www.youtube.com/watch?v=abc",
-            "language": None,
-            "qualified": None,
-            "disqualification_reasons": [],
             "metadata": {
                 "video_title": "ZaloPay review",
                 "video_url": "https://www.youtube.com/watch?v=abc",
@@ -57,20 +50,13 @@ class AgentApiTests(unittest.TestCase):
             },
         }
 
-        async def fake_crawl_app(app_cfg, sources, common_kwargs):
-            return [dict(raw_review)]
+        result = agent_api.process_reviews(
+            [raw], apps=["ZaloPay"], goal="product", days_back=30, focus_area=None
+        )
 
-        with mock.patch.object(agent_api, "_crawl_app", side_effect=fake_crawl_app):
-            result = agent_api.asyncio.run(
-                agent_api.run_research(
-                    apps=["ZaloPay"],
-                    goal="product",
-                    days_back=30,
-                    sources=["youtube"],
-                    crawl_service_url="",
-                )
-            )
-
+        self.assertEqual(len(result["reviews"]), 1)
+        self.assertEqual(result["reviews_by_app"]["ZaloPay"][0]["id"], "sha256:test")
+        self.assertEqual(result["stats"]["ZaloPay"]["qualified"], 1)
         self.assertEqual(
             result["references"],
             [
@@ -85,100 +71,25 @@ class AgentApiTests(unittest.TestCase):
             ],
         )
 
-    def test_run_research_delegates_to_review_crawler_service(self):
+    def test_process_reviews_drops_unqualified(self):
         agent_api = importlib.import_module("scripts.agent_api")
-        service_payload = {
-            "subject": "ZaloPay",
-            "market": "VN",
-            "goal": "qa",
-            "focus": "OTP",
-            "reviews": [
-                {
-                    "id": "sha256:delegated",
-                    "source": "google_play",
-                    "subject": "ZaloPay",
-                    "author": "user2",
-                    "rating": 1,
-                    "content": "OTP fails every time I try to login and complete payment.",
-                    "date": "2026-06-02",
-                    "url": "https://play.google.com/store/apps/details?id=x",
-                    "language": "en",
-                    "qualified": True,
-                    "disqualification_reasons": [],
-                    "metadata": {},
-                }
-            ],
-            "references": [
-                {
-                    "source": "google_play",
-                    "url": "https://play.google.com/store/apps/details?id=x",
-                }
-            ],
-            "stats": {"google_play": {"raw": 1, "qualified": 1}},
-            "outcomes": [{"source": "google_play", "result": "success"}],
-        }
+        too_short = {"source": "reddit", "app": "MoMo", "author": "u",
+                     "content": "ok", "date": "2026-06-01", "url": "https://r/x"}
 
-        async def fake_crawl_reviews(**kwargs):
-            self.assertEqual(kwargs["base_url"], "http://crawler.test")
-            self.assertEqual(kwargs["subject"], "ZaloPay")
-            self.assertEqual(kwargs["market"], "VN")
-            self.assertEqual(kwargs["goal"], "qa")
-            self.assertEqual(kwargs["focus"], "OTP")
-            self.assertEqual(kwargs["sources"], ["google_play"])
-            self.assertEqual(kwargs["filters"]["extra"], "value")
-            return dict(service_payload)
+        result = agent_api.process_reviews(
+            [too_short], apps=["MoMo"], goal="qa", days_back=30
+        )
 
-        with mock.patch("scripts.crawl_client.crawl_reviews", side_effect=fake_crawl_reviews):
-            result = agent_api.asyncio.run(
-                agent_api.run_research(
-                    apps=["ZaloPay"],
-                    goal="qa",
-                    days_back=30,
-                    sources=["google_play"],
-                    focus_area="OTP",
-                    crawl_service_url="http://crawler.test",
-                    crawl_filters={"extra": "value"},
-                )
-            )
+        self.assertEqual(result["reviews"], [])
+        self.assertEqual(result["stats"]["MoMo"]["total"], 1)
+        self.assertEqual(result["stats"]["MoMo"]["qualified"], 0)
 
-        self.assertEqual(result["reviews"][0]["app"], "ZaloPay")
-        self.assertEqual(result["reviews_by_app"]["ZaloPay"][0]["id"], "sha256:delegated")
-        self.assertEqual(result["stats"]["ZaloPay"]["qualified"], 1)
-        self.assertEqual(result["service_results"]["ZaloPay"]["outcomes"][0]["result"], "success")
-
-    def test_run_research_uses_deployed_crawler_service_by_default(self):
+    def test_process_reviews_handles_empty_input(self):
         agent_api = importlib.import_module("scripts.agent_api")
-        service_payload = {
-            "subject": "MoMo",
-            "market": "VN",
-            "goal": "qa",
-            "focus": None,
-            "reviews": [],
-            "references": [],
-            "stats": {},
-            "outcomes": [],
-        }
-
-        async def fake_crawl_reviews(**kwargs):
-            self.assertEqual(
-                kwargs["base_url"],
-                "https://endpoint-503c0bb0-c12f-4b54-919d-edc2c10b633e.agentbase-runtime.aiplatform.vngcloud.vn",
-            )
-            return dict(service_payload)
-
-        with mock.patch.dict("os.environ", {}, clear=True):
-            with mock.patch("scripts.crawl_client.crawl_reviews", side_effect=fake_crawl_reviews):
-                result = agent_api.asyncio.run(
-                    agent_api.run_research(
-                        apps=["MoMo"],
-                        goal="qa",
-                        days_back=30,
-                        sources=["voz"],
-                    )
-                )
-
+        result = agent_api.process_reviews([], apps=["MoMo"], goal="product")
+        self.assertEqual(result["reviews"], [])
         self.assertEqual(result["apps"], ["MoMo"])
-        self.assertIn("MoMo", result["service_results"])
+        self.assertEqual(result["stats"]["MoMo"], {"total": 0, "qualified": 0, "by_source": {}})
 
 
 if __name__ == "__main__":

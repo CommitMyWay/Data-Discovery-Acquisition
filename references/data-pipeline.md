@@ -1,4 +1,4 @@
-# Data Pipeline — Schema, Dedup & Fallback
+# Data Pipeline — Schema, Dedup & Input Contract
 
 ---
 
@@ -123,55 +123,33 @@ def deduplicate(reviews: list) -> list:
 
 ---
 
-## Fallback Dataset Format
+## Raw Record Input Contract
 
-When a live source fails after all retries, the pipeline loads from `--fallback-dataset`. The fallback file must be a JSON array of reviews in the same schema above, with an additional `"fallback_collected_at"` field indicating when the data was originally captured.
+The agent collects raw review records via its built-in `web_search`/`web_fetch` tools and passes them as dicts to `process_reviews()` in `scripts/agent_api.py`. Each raw record must conform to the following shape:
 
 ```json
-[
-  {
-    "id": "sha256:abc123...",
-    "source": "google_play",
-    "app": "ZaloPay",
-    "author": "tran_thi_b",
-    "rating": 2,
-    "content": "App hay bị lỗi khi đăng nhập...",
-    "date": "2024-05-10T14:22:00Z",
-    "url": "https://play.google.com/...",
-    "language": "vi",
-    "qualified": null,
-    "disqualification_reasons": [],
-    "metadata": { "thumbs_up": 3 },
-    "fallback_collected_at": "2024-07-01T00:00:00Z"
-  }
-]
+{
+  "source": "voz",
+  "app": "MoMo",
+  "author": "user1",
+  "rating": null,
+  "content": "...",
+  "date": "2026-05-01",
+  "url": "https://voz.vn/t/...",
+  "metadata": { "thread_title": "..." }
+}
 ```
 
-### Loading fallback data
+Only `source`, `app`, and `content` are required; `make_review()` (in `scripts/processing.py`) defaults the rest.
 
-```python
-def load_fallback(fallback_path: str, source: str, app: str) -> list:
-    if not fallback_path or not os.path.exists(fallback_path):
-        print(f"  [fallback] No fallback dataset at {fallback_path}")
-        return []
-    
-    with open(fallback_path, "r", encoding="utf-8") as f:
-        all_data = json.load(f)
-    
-    # Filter to only the failed source + app
-    matched = [r for r in all_data if r.get("source") == source and r.get("app") == app]
-    print(f"  [fallback] Loaded {len(matched)} records for {source}/{app}")
-    return matched
-```
-
-Reviews loaded from fallback get `metadata.from_fallback: true` so they can be tracked in the output.
+Valid `source` values: `google_play`, `app_store`, `youtube`, `reddit`, `tinhte`, `voz`.
 
 ---
 
 ## Pipeline Execution Order
 
 ```
-1. Crawl all sources (parallel where possible, serial if rate limited)
+1. Agent collects reviews via built-in web_search/web_fetch tools (see SKILL.md)
        ↓
 2. Merge all raw reviews into one list
        ↓
@@ -185,9 +163,7 @@ Reviews loaded from fallback get `metadata.from_fallback: true` so they can be t
        ↓
 7. Quality scoring (add "metadata.high_quality")
        ↓
-8. Sort by date DESC
+8. Apply focus_area ordering (only when a focus topic is provided; otherwise reviews keep qualification order)
        ↓
-9. Write to output JSON + CSV
-       ↓
-10. Print summary report
+9. Return analysis-ready data from process_reviews()
 ```

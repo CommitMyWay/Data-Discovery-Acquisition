@@ -1,12 +1,8 @@
-# Only two third-party deps remain — both are pure-Python wheels with NO browser
-# engine (no Playwright/Chromium). The other four sources (App Store, Reddit,
-# Tinhte, Voz) use the Python standard library only, so they need no installs.
+# Collection is done by the agent's built-in web_search / web_fetch tools — no
+# HTTP libraries or browser engines are needed here. The only third-party dep is
+# langdetect, used by pipeline.py for vi/en language qualification. It is imported
+# lazily and falls back to "vi" if unavailable, so installs are optional.
 #
 #   pip install -r requirements.txt
-#
-# Run with zero installs by dropping these two and relying on the fallback
-# dataset for Google Play + YouTube (see references/sources.md).
 
-google-play-scraper>=1.2.4   # Google Play reviews (internal Play API, no browser)
-yt-dlp>=2024.1.1             # YouTube search + comments + transcripts (no browser)
-langdetect>=1.0.9            # vi/en language qualification (pipeline.py)
+langdetect>=1.0.9   # vi/en language qualification (pipeline.py)
