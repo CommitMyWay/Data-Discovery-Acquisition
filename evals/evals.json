@@ -10,7 +10,7 @@
     {
       "id": 2,
       "prompt": "I need to collect user feedback on ZaloPay from all available sources including YouTube comments and Reddit. The fallback dataset is at /data/zalopay_backup.json. Export results to output/zalopay_reviews.json and also a CSV.",
-      "expected_output": "Run 6-source crawl for ZaloPay using ZaloPay IDs from fintech-apps.md, reference fallback at /data/zalopay_backup.json, output both JSON and CSV.",
+      "expected_output": "Discover ZaloPay handles from fintech-apps.md, then use web_search/web_fetch to collect from all 6 sources (incl. YouTube comments and Reddit). Pass the collected records to process_reviews(); report qualified reviews and references. (No fallback dataset and no CSV export — collection is via the agent's built-in web tools.)",
       "files": []
     },
     {
