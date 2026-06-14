@@ -89,6 +89,7 @@ class AgentApiTests(unittest.TestCase):
         result = agent_api.process_reviews([], apps=["MoMo"], goal="product")
         self.assertEqual(result["reviews"], [])
         self.assertEqual(result["apps"], ["MoMo"])
+        self.assertEqual(result["stats"]["MoMo"], {"total": 0, "qualified": 0, "by_source": {}})
 
 
 if __name__ == "__main__":

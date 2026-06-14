@@ -83,9 +83,6 @@ APP_REGISTRY = {
     },
 }
 
-DEFAULT_SOURCES = ["google_play", "app_store", "youtube", "reddit", "tinhte", "voz"]
-
-
 def _resolve_app(name: str) -> dict:
     """Find app config by name (case-insensitive, partial match ok)."""
     key = name.lower().replace(" ", "").replace("-", "")
@@ -180,18 +177,19 @@ def process_reviews(
     # Per-app stats use ALL normalized records for totals, qualified for the rest.
     raw_by_app = {}
     for r in normalized:
-        raw_by_app.setdefault(r.get("app"), []).append(r)
+        raw_by_app.setdefault(r.get("app") or "Unknown", []).append(r)
 
     reviews_by_app = {}
     for r in qualified:
-        reviews_by_app.setdefault(r.get("app"), []).append(r)
+        reviews_by_app.setdefault(r.get("app") or "Unknown", []).append(r)
 
     stats = {}
     for app_name in set(list(raw_by_app) + list(reviews_by_app) + display_names):
         q = reviews_by_app.get(app_name, [])
         by_source = {}
         for r in q:
-            by_source[r["source"]] = by_source.get(r["source"], 0) + 1
+            src = r.get("source") or "unknown"
+            by_source[src] = by_source.get(src, 0) + 1
         stats[app_name] = {
             "total": len(raw_by_app.get(app_name, [])),
             "qualified": len(q),
