@@ -202,9 +202,9 @@ def is_high_quality(review: dict) -> bool:
     has_feature = any(kw in content for kw in FEATURE_KEYWORDS_VI)
     has_length = len(content.strip()) >= 80
     engagement = (
-        (review.get("metadata") or {}).get("thumbs_up", 0) > 0
-        or (review.get("metadata") or {}).get("like_count", 0) > 0
-        or (review.get("metadata") or {}).get("post_score", 0) > 2
+        ((review.get("metadata") or {}).get("thumbs_up") or 0) > 0
+        or ((review.get("metadata") or {}).get("like_count") or 0) > 0
+        or ((review.get("metadata") or {}).get("post_score") or 0) > 2
     )
     return has_feature and has_length
 
