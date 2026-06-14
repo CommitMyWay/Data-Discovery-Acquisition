@@ -2,9 +2,8 @@
 name: user-review-aggregator
 description: >
   Aggregates user reviews for Vietnamese fintech apps (ZaloPay, MoMo, ShopeePay, VNPay, etc.) 
-  from 6 sources: Google Play, Apple App Store, YouTube (comments + transcript), Reddit, Tinhte, 
-  and Voz. Handles discovery of app/content IDs per source, crawls with auto-retry and fallback 
-  to a local dataset when live sources fail, deduplicates across sources, and qualifies reviews 
+  from 6 sources: Google Play, Apple App Store, YouTube (comments), Reddit, Tinhte, 
+  and Voz. Handles discovery of app/content IDs per source, collects reviews using the platform's built-in web_search/web_fetch tools (skipping any source that is blocked), deduplicates across sources, and qualifies reviews 
   by recency (12 months), minimum length, language (VN/EN), star rating, and spam signals. 
   Use this skill whenever the user wants to collect, analyze, or audit user reviews/feedback 
   for Vietnamese fintech or payment apps — even if they don't say "crawl" or "scrape". 
@@ -59,7 +58,7 @@ Call `web_fetch` on each URL discovered in Phase 1. The table below shows the re
 
 | Source | `web_fetch` target | Notes |
 |--------|-------------------|-------|
-| App Store | `https://itunes.apple.com/rss/customerreviews/id={ios_id}/sortBy=mostRecent/json?country=vn` | Clean JSON; iterate `feed.entry[]` for rating/title/content/date |
+| App Store | `https://itunes.apple.com/rss/customerreviews/id={ios_id}/sortBy=mostRecent/json?country=vn&limit=50&page={n}` | Clean JSON; iterate `feed.entry[]` for rating/title/content/date (paginate pages 1–10; see references/sources.md) |
 | Reddit | append `.json` to the thread URL | Clean JSON; read post + `replies` tree |
 | Tinhte / Voz | thread URLs from Phase 1 | Readable post text; if gated/blocked, skip and note it |
 | Google Play | `https://play.google.com/store/apps/details?id={android_id}&hl=vi&gl=VN` | JS-rendered — rely on `web_search` review snippets plus whatever the page yields |

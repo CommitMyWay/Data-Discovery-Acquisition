@@ -163,7 +163,7 @@ Valid `source` values: `google_play`, `app_store`, `youtube`, `reddit`, `tinhte`
        ↓
 7. Quality scoring (add "metadata.high_quality")
        ↓
-8. Sort by date DESC
+8. Apply focus_area ordering (only when a focus topic is provided; otherwise reviews keep qualification order)
        ↓
 9. Return analysis-ready data from process_reviews()
 ```
